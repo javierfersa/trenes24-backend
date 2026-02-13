@@ -11,32 +11,56 @@ const FEEDS = {
   alerts: "https://gtfsrt.renfe.com/alerts.json"
 };
 
+// Caché simple en memoria
+const CACHE = {
+  trenes: { data: null, ts: 0 },
+  incidencias: { data: null, ts: 0 }
+};
+const CACHE_MS = 30 * 1000; // 30 segundos
+
 async function getJSON(url) {
   try {
     const res = await fetch(url);
     return await res.json();
   } catch (e) {
+    console.error("Error al obtener", url, e.message);
     return { error: true };
   }
 }
 
-app.get("/api/trenes", async (req, res) => {
-  const vehicles = await getJSON(FEEDS.vehicles);
-  const updates = await getJSON(FEEDS.updates);
-  const alerts = await getJSON(FEEDS.alerts);
+function logTrenVacio(v) {
+  if (!v.trip?.trip_id) {
+    console.log("Tren sin trip_id:", JSON.stringify(v).slice(0, 200));
+  }
+}
+
+// Procesa feeds y devuelve { trenes, incidencias }
+async function buildData() {
+  const [vehicles, updates, alerts] = await Promise.all([
+    getJSON(FEEDS.vehicles),
+    getJSON(FEEDS.updates),
+    getJSON(FEEDS.alerts)
+  ]);
 
   const trenes = {};
 
-  // VEHICLES
+  // VEHICLES → trenes base
   if (vehicles.entity) {
     vehicles.entity.forEach(ent => {
       if (!ent.vehicle) return;
       const v = ent.vehicle;
-      const trip = v.trip?.trip_id || "DESCONOCIDO";
+
+      if (!v.trip?.trip_id) {
+        logTrenVacio(v);
+        return; // filtramos trenes sin trip_id
+      }
+
+      const trip = v.trip.trip_id;
+      const linea = trip.split("_")[0] || "??";
 
       trenes[trip] = {
         trip_id: trip,
-        linea: trip.split("_")[0] || "??",
+        linea,
         lat: v.position?.latitude || null,
         lon: v.position?.longitude || null,
         estado: v.current_status || "UNKNOWN",
@@ -45,7 +69,7 @@ app.get("/api/trenes", async (req, res) => {
     });
   }
 
-  // UPDATES
+  // UPDATES → retrasos
   if (updates.entity) {
     updates.entity.forEach(ent => {
       if (!ent.trip_update) return;
@@ -61,25 +85,88 @@ app.get("/api/trenes", async (req, res) => {
     });
   }
 
-  // ALERTS
-  const incidencias = [];
+  // ALERTS → incidencias limpias
+  const incidenciasRaw = [];
   if (alerts.entity) {
     alerts.entity.forEach(ent => {
       if (!ent.alert) return;
       const a = ent.alert;
 
-      incidencias.push({
-        linea: a.informed_entity?.[0]?.route_id || "??",
-        descripcion: a.header_text?.translation?.[0]?.text || ""
-      });
+      const linea = a.informed_entity?.[0]?.route_id || "??";
+      const descripcion = a.header_text?.translation?.[0]?.text || "";
+
+      if (!descripcion.trim()) return; // filtramos vacías
+
+      incidenciasRaw.push({ linea, descripcion });
     });
   }
 
+  // Eliminar incidencias duplicadas
+  const seen = new Set();
+  const incidencias = incidenciasRaw.filter(inc => {
+    const key = inc.linea + "|" + inc.descripcion;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // Ordenar trenes por línea y trip_id
+  const trenesOrdenados = Object.values(trenes).sort((a, b) => {
+    if (a.linea === b.linea) return a.trip_id.localeCompare(b.trip_id);
+    return a.linea.localeCompare(b.linea);
+  });
+
+  return { trenes: trenesOrdenados, incidencias };
+}
+
+// Middleware de caché simple
+async function getCachedData() {
+  const now = Date.now();
+  if (CACHE.trenes.data && now - CACHE.trenes.ts < CACHE_MS) {
+    return {
+      trenes: CACHE.trenes.data,
+      incidencias: CACHE.incidencias.data
+    };
+  }
+
+  const { trenes, incidencias } = await buildData();
+  CACHE.trenes = { data: trenes, ts: now };
+  CACHE.incidencias = { data: incidencias, ts: now };
+  return { trenes, incidencias };
+}
+
+// Endpoint principal
+app.get("/api/trenes", async (req, res) => {
+  const { trenes, incidencias } = await getCachedData();
   res.json({
     timestamp: Date.now(),
-    trenes: Object.values(trenes),
+    trenes,
     incidencias
   });
+});
+
+// Endpoint solo incidencias
+app.get("/api/incidencias", async (req, res) => {
+  const { incidencias } = await getCachedData();
+  res.json({
+    timestamp: Date.now(),
+    incidencias
+  });
+});
+
+// Endpoint solo líneas (únicas)
+app.get("/api/lineas", async (req, res) => {
+  const { trenes } = await getCachedData();
+  const lineasSet = new Set(trenes.map(t => t.linea));
+  res.json({
+    timestamp: Date.now(),
+    lineas: Array.from(lineasSet).sort()
+  });
+});
+
+// Raíz informativa
+app.get("/", (req, res) => {
+  res.send("Backend trenes24-backend operativo. Usa /api/trenes, /api/incidencias o /api/lineas");
 });
 
 const PORT = process.env.PORT || 3000;
