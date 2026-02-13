@@ -25,11 +25,15 @@ async function getJSON(url) {
   }
 }
 
+// Deducir línea a partir del tripId
 function deducirLinea(trip) {
   if (!trip) return "??";
-  const p = trip.split("_")[0];
-  if (!p || p.length > 10) return "??";
-  return p;
+
+  // Buscar última C o R seguida de números/letras
+  const match = trip.match(/([CR])([0-9A-Z]+)$/);
+  if (!match) return "??";
+
+  return match[1] + match[2]; // Ej: C1, C5, R4, R2N
 }
 
 async function buildData() {
@@ -148,4 +152,5 @@ app.get("/", (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Backend GTFS-RT listo en puerto " + PORT));
+
 
